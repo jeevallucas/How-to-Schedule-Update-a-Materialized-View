@@ -1,76 +1,76 @@
+Below are concise, copy‑pasteable steps to refresh your MV via host crontab using docker exec.
 
+Prerequisites
+- MV exists and is initially populated once.
+- Unique index exists to allow CONCURRENTLY.
+- Create a SECURITY DEFINER function so readonly_user can trigger refresh safely:
 
-
-
-Here are two reliable ways to auto-refresh your materialized view in Docker. Since your user is readonly_user, we’ll use a SECURITY DEFINER function so they can trigger refresh safely.
-
-# Option A: Use pg_cron inside PostgreSQL (recommended)
-1) Enable pg_cron in the container (requires restart)
-- With docker-compose:
-```yaml
-services:
-  db:
-    image: postgres:16
-    command:
-      - "postgres"
-      - "-c"
-      - "shared_preload_libraries=pg_cron"
-      - "-c"
-      - "cron.database_name=mydb"     # database where jobs run
-    environment:
-      - POSTGRES_DB=mydb
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=yourpass
-    volumes:
-      - ./init:/docker-entrypoint-initdb.d
-```
-- Or plain docker run:
-```bash
-docker run -d --name pg \
-  -e POSTGRES_DB=mydb -e POSTGRES_PASSWORD=yourpass -e POSTGRES_USER=postgres \
-  -p 5432:5432 postgres:16 \
-  -c shared_preload_libraries=pg_cron \
-  -c cron.database_name=mydb
-```
-
-2) In the DB (run as superuser/owner), install pg_cron:
 ```sql
-CREATE EXTENSION IF NOT EXISTS pg_cron;
-```
-
-3) Create a SECURITY DEFINER function to refresh your MV (owned by the MV owner):
-```sql
--- Create or ensure a role that owns the MV
--- ALTER MATERIALIZED VIEW reporting.report_mv OWNER TO reporting_owner;
-
+-- Run as MV owner or superuser
 CREATE OR REPLACE FUNCTION reporting.refresh_report_mv() RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 AS $$
 BEGIN
-  -- Use CONCURRENTLY if your unique index is in place
   REFRESH MATERIALIZED VIEW CONCURRENTLY reporting.report_mv;
 END
 $$;
 
--- Harden search_path for safety
 ALTER FUNCTION reporting.refresh_report_mv() SET search_path = pg_catalog, reporting;
-
--- Allow readonly_user to call it
 GRANT EXECUTE ON FUNCTION reporting.refresh_report_mv() TO readonly_user;
 ```
 
-4) Schedule with pg_cron
-- As the user who should own the job (can be readonly_user if they can execute the function):
-```sql
--- Every 15 minutes
-SELECT cron.schedule('report_mv_15min', '*/15 * * * *', $$SELECT reporting.refresh_report_mv();$$);
-
--- View jobs
-SELECT * FROM cron.job;
+Option 1 — crontab using readonly_user via docker exec
+1) Quick and simple (uses env var for password)
+- Replace placeholders: <container_name>, mydb, readonly_user, yourpass.
+- Every 15 minutes:
+```
+*/15 * * * * docker exec -e PGPASSWORD='yourpass' <container_name> \
+  psql -U readonly_user -d mydb -v ON_ERROR_STOP=1 \
+  -c "SELECT reporting.refresh_report_mv();" >> /var/log/report_mv_refresh.log 2>&1
 ```
 
-Notes:
-- CREATE EXTENSION requires superuser.
-- The job runs in database mydb (set by cron.database_name).
-- The function runs with the owner’s privileges (SECURITY DEFINER), so readonly_user does not need REFRESH rights.
+2) More secure (avoid password in crontab) with .pgpass inside the container
+- Inside the container, create /var/lib/postgresql/.pgpass (or the home dir of the user you’ll run psql as):
+```
+localhost:5432:mydb:readonly_user:yourpass
+```
+- Permissions:
+```
+docker exec <container_name> sh -lc "printf 'localhost:5432:mydb:readonly_user:yourpass\n' > /var/lib/postgresql/.pgpass && chmod 600 /var/lib/postgresql/.pgpass"
+```
+- Crontab entry (no password in crontab):
+```
+*/15 * * * * docker exec <container_name> \
+  psql -h localhost -U readonly_user -d mydb -v ON_ERROR_STOP=1 \
+  -c "SELECT reporting.refresh_report_mv();" >> /var/log/report_mv_refresh.log 2>&1
+```
+
+Option 2 — crontab as postgres superuser (no function)
+If you prefer to avoid SECURITY DEFINER and let cron run as DB superuser:
+- This typically works if local peer auth is allowed in the container.
+```
+*/15 * * * * docker exec -u postgres <container_name> \
+  psql -d mydb -v ON_ERROR_STOP=1 \
+  -c "REFRESH MATERIALIZED VIEW CONCURRENTLY reporting.report_mv;" >> /var/log/report_mv_refresh.log 2>&1
+```
+
+Test it once manually
+- Run the cron command once in your shell to verify:
+```
+docker exec -e PGPASSWORD='yourpass' <container_name> \
+  psql -U readonly_user -d mydb -c "SELECT reporting.refresh_report_mv();"
+```
+- Check logs:
+```
+tail -n 200 /var/log/report_mv_refresh.log
+```
+- Validate updates:
+```sql
+SELECT COUNT(*) FROM reporting.report_mv;
+```
+
+Notes
+- Replace <container_name> with your Postgres container (e.g., db or pg).
+- If your host is Windows, use Task Scheduler or run cron inside WSL; the docker exec command stays the same.
+- Keep the function’s search_path locked down (as shown) and only grant EXECUTE to roles that should refresh.
